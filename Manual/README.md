@@ -6,9 +6,11 @@
 - Master sends Slave which motor to move at max 45 deg
 - Slave commands Master to stop when 45 reached
 - Limit switch forces Master to stop if it is on.
-
-### TO DO / DOING / TEST:
-
-- Master send slave how much to move : Done
-- Limit switch triggering handling ( Not just stopping motors ) : 
+- Master send slave how much to move 
+- Limit switch triggering handling ( Not just stopping motors ) 
  
+## TO DO / DOING / TEST:
+
+- Add STOP Command ( Small Task )
+- Hand Calculations using prototype ( Need Protoype Completion )
+- Keyboard Mapping and Python File to Connect to Laptop
