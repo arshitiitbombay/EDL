@@ -4,16 +4,21 @@ class MCP23S17:
     def __init__(self, spi, cs, address=1):
         self.spi = spi
         self.cs = cs
-        
-        # Shift the 3-bit address into the correct position (Bits 1, 2, 3)
-        self.opcode = 0x40 | (address << 1)  
-
         self.cs.value(1) # Ensure chip is deselected to start
         
-        # -------- INITIALIZATION --------
+        # -------- THE CHICKEN & EGG FIX --------
+        # 1. Start with Address 000 (0x40) because HAEN is off by default!
+        self.opcode = 0x40   
+        
+        # 2. Send the HAEN enable command to Address 000
         # IOCON register = 0x0A (Enable Hardware Addressing)
         self.write_reg(0x0A, 0x08)  
         
+        # 3. NOW shift to your actual physical wired address (001)
+        # Shift the 3-bit address into the correct position (Bits 1, 2, 3)
+        self.opcode = 0x40 | (address << 1)  
+        
+        # -------- INITIALIZATION --------
         # CONFIGURE BOTH PORTS AS INPUTS (0xFF = 11111111)
         self.write_reg(0x00, 0xFF)  # IODIRA 
         self.write_reg(0x01, 0xFF)  # IODIRB 
