@@ -34,6 +34,5 @@ class PIOEncoder:
                 self.ticks -= 1  # Being dragged Backward
                 
         # Return the absolute value! 
-        # This ensures the logic in main.py (current_ticks >= target_ticks) 
-        # works flawlessly whether the Master commanded a Forward OR Backward move.
         return abs(self.ticks)
+
