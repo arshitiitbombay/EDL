@@ -1,80 +1,96 @@
+import rp2
 import machine
 import time
-from encoder_pio import PIOEncoder 
 from i2c_responder import I2CResponder 
 
 # ==========================================
-# 1. HARDWARE SETUP
+# PIO ENCODER CLASS
 # ==========================================
-NUM_MOTORS = 4
+@rp2.asm_pio()
+def quadrature_encoder():
+    wrap_target()
+    wait(1, pin, 0)      
+    in_(pins, 2)         
+    push(noblock)        
+    wait(0, pin, 0)      
+    wrap()
 
+class PIOEncoder:
+    def __init__(self, sm_id, pin_a, pin_b):
+        self.sm = rp2.StateMachine(sm_id, quadrature_encoder, in_base=pin_a)
+        self.pin_a = pin_a
+        self.pin_b = pin_b
+        self.ticks = 0
+        self.sm.active(1)
+
+    def read(self):
+        while self.sm.rx_fifo():
+            state = self.sm.get() & 0x03 
+            if state == 1:       
+                self.ticks += 1  
+            elif state == 3:     
+                self.ticks -= 1  
+        return abs(self.ticks)
+        
+    def reset(self):
+        # FLUSH THE HARDWARE: Drain any ghost ticks left in the FIFO!
+        while self.sm.rx_fifo():
+            self.sm.get()
+        self.ticks = 0
+
+# ==========================================
+# SYSTEM SETUP
+# ==========================================
+NUM_MOTORS = 8
+
+print("Initializing PIO Encoders...")
 encoders = [
-    PIOEncoder(0, machine.Pin(0), machine.Pin(1)), # Motor 0
-    PIOEncoder(1, machine.Pin(2), machine.Pin(3)), # Motor 1
-    PIOEncoder(2, machine.Pin(8), machine.Pin(9)), # Motor 2
-    PIOEncoder(3, machine.Pin(10), machine.Pin(11))  # Motor 3
+    PIOEncoder(0, machine.Pin(0), machine.Pin(1)),
+    PIOEncoder(1, machine.Pin(2), machine.Pin(3)),
+    PIOEncoder(2, machine.Pin(8), machine.Pin(9)),
+    PIOEncoder(3, machine.Pin(10), machine.Pin(11)),
+    PIOEncoder(4, machine.Pin(12), machine.Pin(13)),
+    PIOEncoder(5, machine.Pin(14), machine.Pin(15)),
+    PIOEncoder(6, machine.Pin(16), machine.Pin(17)),
+    PIOEncoder(7, machine.Pin(18), machine.Pin(19))
 ]
 
 i2c_target = I2CResponder(i2c_device_id=0, sda_gpio=4, scl_gpio=5, responder_address=0x50)
 
-# Array to hold the dynamic target tick limits for each motor
-target_ticks = [0] * NUM_MOTORS
+print("SLAVE READY (PIO Native Mode).")
 
-print("SLAVE READY. Awaiting dynamic targets...")
+incoming_buffer = []
 
-# ==========================================
-# 2. MAIN LOOP
-# ==========================================
 while True:
-    
-    # -------------------------------------------------
-    # TASK 1: RECEIVE DYNAMIC TARGETS (Master -> Slave)
-    # -------------------------------------------------
-    if i2c_target.write_data_is_available():
-        
-        # Grab up to 4 bytes now
-        incoming_data = i2c_target.get_write_data(max_size=4)
-        
-        if len(incoming_data) == 4:
-            command = incoming_data[0]
-            motor_id = incoming_data[1]
-            
-            # Reconstruct the 2-byte angle
-            # Extract bytes 2 and 3, convert back to a standard integer
-            angle = int.from_bytes(bytes(incoming_data[2:4]), 'little')
-            
-            if command == 0x01 and 0 <= motor_id < NUM_MOTORS:
-                
-                encoders[motor_id].read() 
-                encoders[motor_id].ticks = 0 
-                
-                # Calculate the specific tick threshold requested by Master
-                target_ticks[motor_id] = int((angle / 360.0) * 1000)
-                
-                print(f"[RESET] Motor {motor_id} zeroed. Target set to {target_ticks[motor_id]} ticks ({angle} deg)")
+    # --- 1. DRAIN PIO FIFOS CONSTANTLY ---
+    # Running this every cycle without sleeping prevents dropped ticks!
+    for m in range(NUM_MOTORS):
+        encoders[m].read()
 
-    # -------------------------------------------------
-    # TASK 2: SEND THRESHOLD DATA (Slave -> Master)
-    # -------------------------------------------------
-    if i2c_target.read_is_pending():
+    # --- 2. HANDLE MASTER COMMANDS ---
+    if i2c_target.write_data_is_available():
+        incoming_buffer.extend(i2c_target.get_write_data(max_size=2))
         
-        threshold_flags = 0
-        debug_bytes = []
+    if len(incoming_buffer) >= 2:
+        cmd = incoming_buffer[0]
+        m = incoming_buffer[1]
+        
+        if cmd == 0x01 and 0 <= m < NUM_MOTORS:
+            # Trigger the deep flush and reset!
+            encoders[m].reset() 
+            
+        incoming_buffer = [] # Wipe buffer
+
+    # --- 3. SEND TELEMETRY PACKET ---
+    if i2c_target.read_is_pending():
+        data_packet = bytearray(17)
+        data_packet[0] = 0x00 
         
         for m in range(NUM_MOTORS):
-            current_ticks = encoders[m].read()
+            # Grab the current absolute value
+            current_ticks = abs(encoders[m].ticks)
+            data_packet[1 + (m*2)] = current_ticks & 0xFF
+            data_packet[2 + (m*2)] = (current_ticks >> 8) & 0xFF
             
-            # Compare current position against the dynamic target!
-            # (Only flag it if the target is > 0 to prevent instant stops on start)
-            if target_ticks[m] > 0 and current_ticks >= target_ticks[m]:
-                threshold_flags |= (1 << m)
-                
-            clamped_ticks = min(current_ticks, 255)
-            debug_bytes.append(clamped_ticks)
-
-        data_packet = [threshold_flags] + debug_bytes
-        
         for byte in data_packet:
             i2c_target.put_read_data(byte)
-
-    time.sleep_ms(1)
