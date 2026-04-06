@@ -51,7 +51,7 @@ encoders = [
     PIOEncoder(3, machine.Pin(10), machine.Pin(11)),
     PIOEncoder(4, machine.Pin(12), machine.Pin(13)),
     PIOEncoder(5, machine.Pin(14), machine.Pin(15)),
-    PIOEncoder(6, machine.Pin(16), machine.Pin(17)),
+    PIOEncoder(6, machine.Pin(20), machine.Pin(21)),
     PIOEncoder(7, machine.Pin(18), machine.Pin(19))
 ]
 
