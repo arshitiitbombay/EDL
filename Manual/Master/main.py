@@ -82,8 +82,8 @@ while True:
                         reset_confirmed = False
                         for _ in range(50): # Wait up to 50ms
                             try:
-                                check_data = i2c_slave.readfrom(SLAVE_ADDR, 17)
-                                check_ticks = int.from_bytes(check_data[1 + (motor_id*2) : 3 + (motor_id*2)], 'little')
+                                check_data = i2c_slave.readfrom(SLAVE_ADDR, 16) #changed 17 to 16 here
+                                check_ticks = int.from_bytes(check_data[(motor_id*2) : 2 + (motor_id*2)], 'little')
                                 
                                 # Check if Slave successfully zeroed out the encoder
                                 if check_ticks == 0:
@@ -108,11 +108,11 @@ while True:
     # ==========================================
     if any(move_in_progress):
         try:
-            data = i2c_slave.readfrom(SLAVE_ADDR, 17)
+            data = i2c_slave.readfrom(SLAVE_ADDR, 16) #changed 17 to 16 here
 
             for m in range(NUM_ENCODERS):
                 if move_in_progress[m]:
-                    live_ticks = int.from_bytes(data[1 + (m*2) : 3 + (m*2)], 'little')
+                    live_ticks = int.from_bytes(data[(m*2) : 2 + (m*2)], 'little')
                     
                     if live_ticks >= current_targets[m]:
                         feathers.state_hold(m)
