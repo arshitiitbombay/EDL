@@ -1,3 +1,33 @@
+"""from machine import Pin, mem32
+from i2c_responder import I2CResponder
+import time
+
+# LED Initialization - Permanently ON
+led = Pin("LED", Pin.OUT)
+led.value(1) 
+
+# Initialize Slave on GP4 (SDA) and GP5 (SCL)
+# i2c_device_id=0 targets I2C0 hardware peripheral
+slave = I2CResponder(0, sda_gpio=4, scl_gpio=5, responder_address=0x50)
+
+print("Slave Ready (LED ON) on GP4/5. Waiting for Master...")
+
+while True:
+    # 1. Check for incoming data from Master
+    if slave.write_data_is_available():
+        data = slave.get_write_data(max_size=2)
+        print(f"Master sent: {data}")
+
+    # 2. Check if Master is requesting data
+    if slave.read_is_pending():
+        # Send 16 bytes of data back to Master
+        for i in range(1, 17):
+            slave.put_read_data(i)
+    
+    # Keep the loop tight to prevent Master timeouts (EIO)
+    time.sleep_ms(2)
+
+"""
 import rp2
 import machine
 import time
@@ -6,6 +36,8 @@ from i2c_responder import I2CResponder
 # ==========================================
 # PIO ENCODER CLASS
 # ==========================================
+led = machine.Pin("LED", machine.Pin.OUT)
+led.value(1)
 @rp2.asm_pio()
 def quadrature_encoder():
     wrap_target()
@@ -51,8 +83,8 @@ encoders = [
     PIOEncoder(3, machine.Pin(10), machine.Pin(11)),
     PIOEncoder(4, machine.Pin(12), machine.Pin(13)),
     PIOEncoder(5, machine.Pin(14), machine.Pin(15)),
-    PIOEncoder(6, machine.Pin(20), machine.Pin(21)),
-    PIOEncoder(7, machine.Pin(18), machine.Pin(19))
+    PIOEncoder(6, machine.Pin(22), machine.Pin(26)),
+    PIOEncoder(7, machine.Pin(20), machine.Pin(21))
 ]
 
 i2c_target = I2CResponder(i2c_device_id=0, sda_gpio=4, scl_gpio=5, responder_address=0x50)
