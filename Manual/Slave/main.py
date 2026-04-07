@@ -79,18 +79,18 @@ while True:
             # Trigger the deep flush and reset!
             encoders[m].reset() 
             
-        incoming_buffer = [] # Wipe buffer
+        incoming_buffer = incoming_buffer[2:] # (not wipe)
 
     # --- 3. SEND TELEMETRY PACKET ---
     if i2c_target.read_is_pending():
-        data_packet = bytearray(17)
-        data_packet[0] = 0x00 
+        data_packet = bytearray(16) #changed 17 to 16
+        #data_packet[0] = 0x00 
         
         for m in range(NUM_MOTORS):
             # Grab the current absolute value
             current_ticks = abs(encoders[m].ticks)
-            data_packet[1 + (m*2)] = current_ticks & 0xFF
-            data_packet[2 + (m*2)] = (current_ticks >> 8) & 0xFF
+            data_packet[(m*2)] = current_ticks & 0xFF #was 1 + (m*2)
+            data_packet[1 + (m*2)] = (current_ticks >> 8) & 0xFF  #was 2 + (m*2)
             
         for byte in data_packet:
             i2c_target.put_read_data(byte)
