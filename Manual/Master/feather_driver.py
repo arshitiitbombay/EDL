@@ -32,8 +32,9 @@ class FeatherDriver:
         board.duty(pwm_pin, speed)
         
         if speed == 0:
-            board.duty(in1_pin, 0)
-            board.duty(in2_pin, 0)
+            # THIS IS THE BRAKE FIX: Both pins must be 4095 (HIGH)
+            board.duty(in1_pin, 4095)
+            board.duty(in2_pin, 4095)
         elif direction_forward:
             board.duty(in1_pin, 4095) 
             board.duty(in2_pin, 0)    
