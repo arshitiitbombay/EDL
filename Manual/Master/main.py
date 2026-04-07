@@ -3,6 +3,7 @@ import time
 import sys
 import select
 from feather_driver import FeatherDriver
+from mcp23s17 import MCP23S17
 
 led = machine.Pin("LED", machine.Pin.OUT)
 led.value(1)
@@ -11,6 +12,19 @@ led.value(1)
 """mcp_reset = machine.Pin(0, machine.Pin.OUT)
 mcp_reset.value(1)
 time.sleep_ms(10)"""
+
+#Setting reset pin to 1 
+mcp_reset = machine.Pin(0, machine.Pin.OUT)
+mcp_reset.value(1)
+time.sleep_ms(10)
+
+#Limit switch and MCP
+LIMIT_SWITCH_PIN = 4
+spi = machine.SPI(0, baudrate=1000000, polarity=0, phase=0,
+                  sck=machine.Pin(2), mosi=machine.Pin(3), miso=machine.Pin(4))
+cs = machine.Pin(5, machine.Pin.OUT)
+mcp = MCP23S17(spi, cs)
+
 
 i2c_slave = machine.I2C(1, scl=machine.Pin(11), sda=machine.Pin(10), freq=100000)
 device = i2c_slave.scan()
@@ -42,7 +56,31 @@ for m in range(NUM_MOTORS):
 print("[SYSTEM] All 9 motors locked in HOLD state.")
 
 while True:
-    # ==========================================
+    # TASK 0:
+    try:
+        limit_state = mcp.read_all()
+        #print("read success")
+        # If the specific limit switch is pressed (pulled to 0V)
+        if (limit_state & (1 << LIMIT_SWITCH_PIN)) == 0: 
+            print("yo")
+            any_motor_stopped = False
+            feathers.state_hold(8)
+            for m in range(NUM_ENCODERS):
+            
+                if move_in_progress[m]:
+                    feathers.state_hold(m)
+                    move_in_progress[m] = False
+                    any_motor_stopped = True
+
+            if any_motor_stopped:
+                print("[SAFETY] Limit Switch Triggered! All motors HALTED.")
+            
+            # Restart the loop immediately. Do not process USB or I2C.
+            continue
+    except Exception as e:
+        print(f"[ERROR] Port Expander read failed: {e}")
+        
+    # =========================================
     # TASK 1: KEYBOARD COMMANDS
     # ==========================================
     if usb_poll.poll(0):
