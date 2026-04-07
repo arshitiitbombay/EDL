@@ -4,12 +4,25 @@ import sys
 import select
 from feather_driver import FeatherDriver
 
-# ---------------- HARDWARE SETUP ----------------
-i2c_motor = machine.I2C(0, scl=machine.Pin(17), sda=machine.Pin(16), freq=400000)
-feathers = FeatherDriver(i2c_motor, addresses=[0x60, 0x61]) 
+led = machine.Pin("LED", machine.Pin.OUT)
+led.value(1)
 
-i2c_slave = machine.I2C(1, scl=machine.Pin(11), sda=machine.Pin(10), freq=400000)
+# ---------------- HARDWARE SETUP ----------------
+"""mcp_reset = machine.Pin(0, machine.Pin.OUT)
+mcp_reset.value(1)
+time.sleep_ms(10)"""
+
+i2c_slave = machine.I2C(1, scl=machine.Pin(11), sda=machine.Pin(10), freq=100000)
+device = i2c_slave.scan()
+print(device)
 SLAVE_ADDR = 0x50
+
+i2c_motor = machine.I2C(0, scl=machine.Pin(17), sda=machine.Pin(16), freq=100000)
+device2 = i2c_motor.scan()
+feathers = FeatherDriver(i2c_motor, addresses=[0x60,0x61,0x62]) 
+
+print(device2)
+
 
 usb_poll = select.poll()
 usb_poll.register(sys.stdin, select.POLLIN)
