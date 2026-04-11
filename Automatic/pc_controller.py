@@ -4,39 +4,60 @@ import serial.tools.list_ports
 import threading
 import time
 import sys
+import copy
 import numpy as np
 
 # ==========================================
-# 1. ROBOT HARDWARE MAPPING
+# 1. ROBOT HARDWARE MAPPING & TUNING
 # ==========================================
-MAX_ANGLE = 500.0  # Maximum bend per link in degrees
-STEPS_PER_PUSH = 10 
-PWM_SPEED = 60
+MAX_ANGLE = 250.0            # Absolute maximum clamp for any link
+STEPS_PER_PUSH = 12
+PWM_SPEED = 100
+STEERING_TIME = 2.0          # Time to bend when steering (no lead screw)
 
-# We map your specific motor directions here!
-# Format: { 0 (Pan Axis): (Motor_ID, Pos_Dir, Neg_Dir), 1 (Tilt Axis): (Motor_ID, Pos_Dir, Neg_Dir) }
-# Positive Pan = Right | Negative Pan = Left
-# Positive Tilt = Up   | Negative Tilt = Down
-LINK_CONFIG = [
-    # LINK 1 (TIP) - Pan (Right/Left: M1), Tilt (Up/Down: M0)
-    { 0: (1, 0, 1), 1: (0, 1, 0) }, 
-    
-    # LINK 2 - Pan (Right/Left: M3), Tilt (Up/Down: M2)
-    { 0: (3, 0, 1), 1: (2, 0, 1) }, 
-    
-    # LINK 3 - Pan (Right/Left: M5), Tilt (Up/Down: M4)
-    { 0: (5, 1, 0), 1: (4, 1, 0) }, 
-    
-    # LINK 4 (BASE) - Pan (Right/Left: M7), Tilt (Up/Down: M6)
-    { 0: (7, 0, 1), 1: (6, 0, 1) }  
+# Multipliers to compensate for mechanical friction/weight during INSERTION
+# Format: [[Pan, Tilt], [Pan, Tilt], [Pan, Tilt], [Pan, Tilt]]
+LINK_MULTIPLIERS = [
+    [0.75, 0.75],  # LINK 1 (Tip)
+    [1.0, 1.0],  # LINK 2
+    [1.1, 1.1],  # LINK 3
+    [1.1, 1.1]   # LINK 4 (Base)
 ]
 
-# State Trackers: [pan_angle, tilt_angle] for each of the 4 links
+# Multipliers to compensate for tendon slack/hysteresis during RETRACTION
+# Format: [[Pan, Tilt], [Pan, Tilt], [Pan, Tilt], [Pan, Tilt]]
+LINK_RETRACTION_MULTIPLIERS = [
+    [0.5, 0.5],    # LINK 1
+    [0.5, 0.5],  # LINK 2
+    [0.5, 0.5],  # LINK 3
+    [0.5, 0.5]   # LINK 4
+]
+
+# Specific time required to push each link out
+# [Link 1 (Tip), Link 2, Link 3, Link 4 (Base)]
+INSERTION_TIMES = [3.75, 5.3, 6.0, 3.0]
+
+# Format: { 0 (Pan): (Motor_ID, Pos_Dir, Neg_Dir), 1 (Tilt): (Motor_ID, Pos_Dir, Neg_Dir) }
+LINK_CONFIG = [
+    { 0: (1, 0, 1), 1: (0, 1, 0) }, # LINK 1 (TIP)
+    { 0: (3, 0, 1), 1: (2, 0, 1) }, # LINK 2
+    { 0: (5, 1, 0), 1: (4, 1, 0) }, # LINK 3
+    { 0: (7, 0, 1), 1: (6, 0, 1) }  # LINK 4 (BASE)
+]
+
+# State Trackers
 link_targets   = [[0.0, 0.0] for _ in range(4)]
 current_angles = [[0.0, 0.0] for _ in range(4)]
 
-trajectory_memory = []
-tentacle_closed = False # Track the state of Motor 8
+# Memory now starts empty. It will store Actions instead of States.
+trajectory_memory = [] 
+
+tentacle_closed = False 
+is_moving = False 
+
+# --- SYSTEM LOCK FLAGS ---
+limit_active = False 
+HARD_FAULT_LOCKED = False 
 
 # ==========================================
 # 2. SERIAL CONNECTION
@@ -45,7 +66,7 @@ def connect_pico():
     ports = serial.tools.list_ports.comports()
     for port in ports:
         if "Pico" in port.description or "Serial" in port.description:
-            return serial.Serial(port.device, 115200, timeout=1)
+            return serial.Serial(port.device, 115200, timeout=0.1)
     return None
 
 try:
@@ -58,193 +79,320 @@ except Exception as e:
     print(f"[ERROR] {e}")
     sys.exit()
 
-# ==========================================
-# 3. KINEMATIC COMMAND SENDER
-# ==========================================
+# --- NEW: Master Serial Transmission Wrapper ---
+def tx_command(cmd_str):
+    """Prints the command to the console, then sends it to the Pico."""
+    print(f"[SERIAL TX] {cmd_str.strip()}")
+    ser.write(cmd_str.encode('utf-8'))
+
 def send_motor_command(motor_id, direction, abs_angle):
-    """Sends the raw command to the Pico"""
     if abs_angle == 0: return 
     cmd = f"START,{motor_id},{direction},{abs_angle},{PWM_SPEED}\n"
-    ser.write(cmd.encode('utf-8'))
+    tx_command(cmd)
 
 # ==========================================
-# 4. FOLLOW-THE-LEADER EXECUTION THREAD
+# 3. BACKGROUND SERIAL READER & LIMIT LOGIC
 # ==========================================
-def execute_discrete_insertion():
-    """Runs in the background, slicing the movement into 10 steps"""
-    print("\n[ROBOT] Beginning Discrete FTL Insertion...")
+def serial_reader_thread():
+    """Constantly listens to the Pico in the background."""
+    while True:
+        if ser.in_waiting > 0:
+            try:
+                line = ser.readline().decode('utf-8').strip()
+                if line.startswith("LIMIT"):
+                    _, mcp_id, pin = line.split(',')
+                    threading.Thread(target=handle_limit_switch, args=(int(mcp_id), int(pin)), daemon=True).start()
+                elif line != "":
+                    print(f"[PICO] {line}")
+            except: pass
+        time.sleep(0.01)
+
+threading.Thread(target=serial_reader_thread, daemon=True).start()
+
+def handle_limit_switch(mcp_id, pin):
+    """Case-wise logic for what to do when a limit switch is hit."""
+    global limit_active, current_angles
+    limit_active = True 
     
-    # 1. FIRE THE LEAD SCREW (Motor 9)
-    # The Pico will automatically run this for exactly 2 seconds!
-    ls_cmd = f"START,9,1,0,{PWM_SPEED}\n"
-    ser.write(ls_cmd.encode('utf-8'))
-    print(" -> Lead Screw Engaged (2-second automatic timer)")
+    print(f"\n======================================")
+    print(f"!!! LIMIT SWITCH TRIGGERED: MCP{mcp_id} PIN {pin} !!!")
+    print(f"======================================")
     
-    # Snapshot of where we are right now before we start stepping
-    start_angles = [[current_angles[i][m] for m in range(2)] for i in range(4)]
+    # CASE 1: Pin 14 Hit Example
+    if mcp_id == 1 and pin == 14:
+        print("[LIMIT LOGIC] Escaping Pin 14. Backing off M4 and M2 by 50 deg...")
+        send_motor_command(4, 0, 50)
+        send_motor_command(2, 0, 50)
+        current_angles[2][1] -= 50.0  # Update M4 (Link 3 Tilt)
+        current_angles[1][1] -= 50.0  # Update M2 (Link 2 Tilt)
+        time.sleep(1.5)
+        print("[LIMIT LOGIC] Escape complete. Resuming previous operation.")
     
-    # 2. DISCRETIZE BENDING INTO 10 STEPS
+    # CASE 2: Pin 7 Hit Example
+    elif mcp_id == 1 and pin == 7: 
+        print("[LIMIT LOGIC] Escaping Pin 7. Backing off M1 by 50 deg...")
+        send_motor_command(1, 1, 50)
+        current_angles[0][0] -= 50.0  # Update M1 (Link 1 Pan)
+        time.sleep(1.5)
+        print("[LIMIT LOGIC] Escape complete. Resuming previous operation.")
+
+    limit_active = False 
+
+# ==========================================
+# 4. EXECUTION THREADS (THE NEW LOGIC)
+# ==========================================
+def execute_discrete_step(ls_level):
+    global is_moving, HARD_FAULT_LOCKED
+    is_moving = True
+    
+    current_memory = trajectory_memory[-1] # Grab the active memory node
+    
+    if ls_level > 0:
+        total_time = INSERTION_TIMES[ls_level - 1]
+        print(f"\n[ROBOT] Inserting Link {ls_level} (Duration: {total_time}s)...")
+        tx_command("START,9,1,0,100\n") 
+    else:
+        total_time = STEERING_TIME
+        print(f"\n[ROBOT] Steering outside box. Links shifting. (Duration: {total_time}s)...")
+        
+    step_delay = total_time / STEPS_PER_PUSH
+    start_angles = copy.deepcopy(current_angles)
+    
     for step in range(1, STEPS_PER_PUSH + 1):
-        for i in range(4): # Loop through Links 0 to 3
-            for m in range(2): # m=0 is Pan (X-axis), m=1 is Tilt (Y-axis)
-                
-                # Where exactly should we be at this specific step?
-                ideal_absolute = start_angles[i][m] + ((link_targets[i][m] - start_angles[i][m]) * (step / STEPS_PER_PUSH))
-                
-                # How much further do we need to move to get there?
+        while limit_active:
+            time.sleep(0.1)
+            
+        if HARD_FAULT_LOCKED:
+            break
+
+        for i in range(4): 
+            for m in range(2): 
+                scaled_target = link_targets[i][m] * LINK_MULTIPLIERS[i][m]
+                ideal_absolute = start_angles[i][m] + ((scaled_target - start_angles[i][m]) * (step / STEPS_PER_PUSH))
                 delta = ideal_absolute - current_angles[i][m]
                 integer_delta = int(round(delta))
                 
+                # --- MAX ANGLE ABSOLUTE FAULT CHECK ---
+                if abs(current_angles[i][m] + integer_delta) >= MAX_ANGLE:
+                    print(f"\n[CRITICAL FAULT] Link {i+1} attempted to exceed {MAX_ANGLE} deg!")
+                    tx_command("S\n") 
+                    HARD_FAULT_LOCKED = True
+                    is_moving = False
+                    return 
+
                 if integer_delta != 0:
-                    # Look up the specific motor and direction in our Hardware Map
                     motor_id, pos_dir, neg_dir = LINK_CONFIG[i][m]
-                    
-                    # Choose the direction based on whether we are moving Positive or Negative
                     direction = pos_dir if integer_delta > 0 else neg_dir
                     
-                    # Send the command and update our local tracker
                     send_motor_command(motor_id, direction, abs(integer_delta))
+                    
+                    # Update Tracker AND record the exact action taken in memory!
                     current_angles[i][m] += integer_delta
+                    current_memory["motor_deltas"][i][m] += integer_delta
 
-        # Wait for 0.2 seconds so the 10 bending steps take exactly 2 seconds total,
-        # perfectly matching the linear push of the lead screw!
-        time.sleep(0.2) 
+        time.sleep(step_delay) 
 
-    print("[ROBOT] Insertion Step Complete. Awaiting next click.")
+    if ls_level > 0 and not HARD_FAULT_LOCKED:
+        tx_command("START,9,1,0,0\n") 
+        
+    if not HARD_FAULT_LOCKED:
+        print("[ROBOT] Step Complete. Awaiting next command.")
+    is_moving = False
+
 
 def execute_discrete_retraction():
-    """Runs in the background, pulling the robot back one step along its memory"""
-    global link_targets, trajectory_memory
+    global link_targets, trajectory_memory, is_moving, HARD_FAULT_LOCKED
     
-    # 1. Check if we actually have steps to remember!
-    if len(trajectory_memory) <= 1:
+    if len(trajectory_memory) == 0:
         print("[ROBOT] At home position! Nothing to retract.")
         return
 
-    print("\n[ROBOT] Beginning Discrete FTL Retraction...")
+    is_moving = True
+    HARD_FAULT_LOCKED = False 
     
-    # 2. POP the current state, and load the PREVIOUS state into targets
-    trajectory_memory.pop() # Discard current
-    previous_state = trajectory_memory[-1] # Look at the previous
+    last_move = trajectory_memory.pop() 
+    ls_level_to_reverse = last_move["ls_level"]
     
-    # Deep copy the memory back into active targets
-    link_targets = [[previous_state[i][m] for m in range(2)] for i in range(4)]
+    # 1. Restore the FTL link targets so next forward push is mathematically correct
+    link_targets = copy.deepcopy(last_move["old_targets"])
+
+    # 2. Restore current_angles instantly. We assume the retraction will be successful.
+    for i in range(4):
+        for m in range(2):
+            current_angles[i][m] -= last_move["motor_deltas"][i][m]
+
+    if ls_level_to_reverse > 0:
+        total_time = INSERTION_TIMES[ls_level_to_reverse - 1]
+        print(f"\n[ROBOT] Retracting Link {ls_level_to_reverse} via Action Undo (Duration: {total_time}s)...")
+        tx_command("START,9,0,0,100\n") 
+    else:
+        total_time = STEERING_TIME
+        print(f"\n[ROBOT] Retracting Steering Move via Action Undo (Duration: {total_time}s)...")
+
+    step_delay = total_time / STEPS_PER_PUSH
+    undone_so_far = [[0, 0] for _ in range(4)]
     
-    # 3. FIRE THE LEAD SCREW BACKWARDS (Direction 0)
-    ls_cmd = f"START,9,0,0,{PWM_SPEED}\n"
-    ser.write(ls_cmd.encode('utf-8'))
-    print(" -> Lead Screw Retracting (2-second automatic timer)")
-    
-    start_angles = [[current_angles[i][m] for m in range(2)] for i in range(4)]
-    
-    # 4. DISCRETIZE BENDING INTO 10 STEPS
+    # 3. Physically Undo the motor actions step-by-step
     for step in range(1, STEPS_PER_PUSH + 1):
+        while limit_active:
+            time.sleep(0.1)
+            
         for i in range(4): 
             for m in range(2): 
+                forward_delta = last_move["motor_deltas"][i][m]
+                if forward_delta == 0: continue
                 
-                ideal_absolute = start_angles[i][m] + ((link_targets[i][m] - start_angles[i][m]) * (step / STEPS_PER_PUSH))
-                delta = ideal_absolute - current_angles[i][m]
-                integer_delta = int(round(delta))
+                # Calculate total reversal needed (inverted sign, scaled by retraction multiplier)
+                total_reversal = -forward_delta * LINK_RETRACTION_MULTIPLIERS[i][m]
+                ideal_reversal_by_now = total_reversal * (step / STEPS_PER_PUSH)
                 
-                if integer_delta != 0:
+                step_delta = ideal_reversal_by_now - undone_so_far[i][m]
+                integer_step_delta = int(round(step_delta))
+                
+                if integer_step_delta != 0:
                     motor_id, pos_dir, neg_dir = LINK_CONFIG[i][m]
-                    direction = pos_dir if integer_delta > 0 else neg_dir
+                    direction = pos_dir if integer_step_delta > 0 else neg_dir
                     
-                    send_motor_command(motor_id, direction, abs(integer_delta))
-                    current_angles[i][m] += integer_delta
+                    send_motor_command(motor_id, direction, abs(integer_step_delta))
+                    undone_so_far[i][m] += integer_step_delta
 
-        # Wait for 0.2s so the bending matches the 2-second lead screw pull
-        time.sleep(0.2) 
+        time.sleep(step_delay) 
 
-    print("[ROBOT] Retraction Step Complete. Ready.")   
+    if ls_level_to_reverse > 0:
+        tx_command("START,9,0,0,0\n") 
+        
+    print("[ROBOT] Retraction Step Complete.")
+    is_moving = False
+
+def pure_retract_thread():
+    global is_moving
+    is_moving = True
+    print("\n[SYSTEM] Pure Lead Screw Retraction (2 seconds)...")
+    tx_command("START,9,0,0,100\n")
+    time.sleep(2.0)
+    tx_command("START,9,0,0,0\n") 
+    print("[SYSTEM] Pure Retraction Complete.")
+    is_moving = False
+
 # ==========================================
 # 5. CAMERA & GUI LOGIC
 # ==========================================
-def mouse_click(event, x, y, flags, param):
+def push_trajectory_and_execute(delta_pan, delta_tilt):
     global link_targets, trajectory_memory
     
+    new_pan_target = link_targets[0][0] + delta_pan
+    new_tilt_target = link_targets[0][1] + delta_tilt
+    
+    pan_target = max(min(new_pan_target, MAX_ANGLE), -MAX_ANGLE)
+    tilt_target = max(min(new_tilt_target, MAX_ANGLE), -MAX_ANGLE)
+    
+    print(f"\n[TARGET] Click Added. New Absolute Target: Pan={pan_target:.1f}°, Tilt={tilt_target:.1f}°")
+
+    # Save the CURRENT targets before we shift them, so we can restore them on retract
+    old_targets = copy.deepcopy(link_targets)
+
+    # Shift old targets down the chain
+    link_targets[3] = list(link_targets[2]) 
+    link_targets[2] = list(link_targets[1]) 
+    link_targets[1] = list(link_targets[0]) 
+    link_targets[0] = [pan_target, tilt_target]
+    
+    current_step = len(trajectory_memory) 
+    ls_level = current_step + 1 if current_step < 4 else 0
+    
+    # Generate the Memory Node
+    trajectory_memory.append({
+        "old_targets": old_targets,
+        "ls_level": ls_level,
+        "motor_deltas": [[0, 0] for _ in range(4)] # Will be filled during execution
+    })
+
+    threading.Thread(target=execute_discrete_step, args=(ls_level,), daemon=True).start()
+
+def mouse_click(event, x, y, flags, param):
+    global is_moving
     if event == cv2.EVENT_LBUTTONDOWN:
+        if is_moving:
+            print("[GUI] Ignoring click: Robot is currently moving!")
+            return
+
         frame_w, frame_h = param
         center_x, center_y = frame_w // 2, frame_h // 2
         
-        # Calculate distance from center (Pixels)
         dx = x - center_x
-        dy = center_y - y # Invert Y so up is positive
+        dy = center_y - y 
         
-        # Scale pixels to Angles (-MAX_ANGLE to +MAX_ANGLE)
-        pan_target = (dx / (frame_w / 2)) * MAX_ANGLE
-        tilt_target = (dy / (frame_h / 2)) * MAX_ANGLE
-        
-        # Clamp to max physical constraints
-        pan_target = max(min(pan_target, MAX_ANGLE), -MAX_ANGLE)
-        tilt_target = max(min(tilt_target, MAX_ANGLE), -MAX_ANGLE)
-        
-        print(f"\n[GUI] Clicked! Target Angle: Pan={pan_target:.1f}°, Tilt={tilt_target:.1f}°")
-
-        # Shift old targets down the chain (Follow-the-leader behavior)
-        link_targets[3] = list(link_targets[2]) 
-        link_targets[2] = list(link_targets[1]) 
-        link_targets[1] = list(link_targets[0]) 
-        link_targets[0] = [pan_target, tilt_target]
-        
-        trajectory_memory.append(list(link_targets))
-
-        # Start the discrete execution in a background thread
-        threading.Thread(target=execute_discrete_insertion, daemon=True).start()
+        delta_pan = (dx / (frame_w / 2)) * MAX_ANGLE
+        delta_tilt = (dy / (frame_h / 2)) * MAX_ANGLE
+        push_trajectory_and_execute(delta_pan, delta_tilt)
 
 def main():
-    global tentacle_closed
-    cap = cv2.VideoCapture(1) # Index 1 for the Robot USB Camera
+    global tentacle_closed, is_moving
     
+    cap = cv2.VideoCapture(1) 
     ret, frame = cap.read()
     if not ret:
-        print("[ERROR] Cannot access camera. Try changing VideoCapture(1) to 0 or 2.")
+        print("[ERROR] Cannot access camera.")
         return
     h, w, _ = frame.shape
     
-    cv2.namedWindow("Continuum Eye")
+    cv2.namedWindow("Continuum Eye", cv2.WINDOW_NORMAL)
+    is_fullscreen = False
     cv2.setMouseCallback("Continuum Eye", mouse_click, param=(w, h))
     
     print("\n--- AUTO CONTROLLER READY ---")
-    print("Click on the video feed to steer the robot.")
-    print("Press 'T' to toggle the Tentacle (Gripper).")
-    print("Press 'R' to RETRACT the Lead Screw (Pull back).")
-    print("Press 'SPACE' to Emergency Stop.")
-    print("Press 'Q' to Quit.")
+    print("Click Feed: Insert/Steer FTL Trajectory")
+    print("Press 'R': Revert one step via FTL Memory")
+    print("Press 'T': Toggle the Tentacle (Gripper)")
+    print("Press 'B': PURE Retract (Lead Screw only, no memory)")
+    print("Press 'F': Toggle Fullscreen")
+    print("Press 'SPACE': Emergency Stop")
+    print("Press 'Q': Quit")
     
     while True:
         ret, frame = cap.read()
         if not ret: break
         
-        # Draw Targeting Crosshair
         cv2.line(frame, (w//2, 0), (w//2, h), (0, 255, 0), 1)
         cv2.line(frame, (0, h//2), (w, h//2), (0, 255, 0), 1)
         
-        # Display Tentacle Status on screen
-        status_text = "Tentacle: CLOSED" if tentacle_closed else "Tentacle: OPEN"
-        color = (0, 0, 255) if tentacle_closed else (0, 255, 0)
-        cv2.putText(frame, status_text, (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, color, 2)
+        current_step = len(trajectory_memory)
+        seq_text = f"Inserted Links: {min(current_step, 4)}/4 | Steer Clicks: {max(0, current_step - 4)}"
+        cv2.putText(frame, seq_text, (10, h - 20), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 0), 2)
+        
+        if HARD_FAULT_LOCKED:
+            cv2.putText(frame, "MAX ANGLE REACHED! LOCKED.", (w//2 - 200, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 255), 2)
+        elif limit_active:
+            cv2.putText(frame, "LIMIT SWITCH ESCAPE ACTIVE", (w//2 - 200, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 165, 255), 2)
+        elif is_moving:
+            cv2.putText(frame, "MOVING... PLEASE WAIT", (w - 250, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2)
         
         cv2.imshow("Continuum Eye", frame)
         
         key = cv2.waitKey(1) & 0xFF
         if key == ord('q'):
-            ser.write(b"S\n")
+            tx_command("S\n")
             break
         elif key == ord(' '): 
-            ser.write(b"S\n")
+            tx_command("S\n")
             print("[EMERGENCY STOP SENT]")
         elif key == ord('t'):
-            # Toggle Motor 8 (Tentacle)
-            tentacle_closed = not tentacle_closed
-            state_val = 1 if tentacle_closed else 0
-            ser.write(f"GRIP,{state_val}\n".encode('utf-8'))
-            print(f"[SYSTEM] Tentacle {'Closed' if tentacle_closed else 'Opened'}")
+            if not is_moving:
+                tentacle_closed = not tentacle_closed
+                state_val = 1 if tentacle_closed else 0
+                tx_command(f"GRIP,{state_val}\n")
+        elif key == ord('b'):
+            if not is_moving:
+                threading.Thread(target=pure_retract_thread, daemon=True).start()
         elif key == ord('r'):
-            # Manual Retract: Motor 9, Direction 0 (Backward)
-            cmd = f"START,9,0,0,{PWM_SPEED}\n"
-            ser.write(cmd.encode('utf-8'))
-            print("[SYSTEM] Retracting Lead Screw for 2 seconds...")
+            if not is_moving:
+                threading.Thread(target=execute_discrete_retraction, daemon=True).start()
+        elif key == ord('f'): 
+            is_fullscreen = not is_fullscreen
+            if is_fullscreen:
+                cv2.setWindowProperty("Continuum Eye", cv2.WND_PROP_FULLSCREEN, cv2.WINDOW_FULLSCREEN)
+            else:
+                cv2.setWindowProperty("Continuum Eye", cv2.WND_PROP_FULLSCREEN, cv2.WINDOW_NORMAL)
 
     cap.release()
     cv2.destroyAllWindows()
